@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -101,7 +102,17 @@ type author struct {
 func main() {
 	org := flag.String("org", "", "GitHub organization to query (required)")
 	hours := flag.Int("hours", 24, "Time window in hours")
+	jsonLogs := flag.Bool("json-logs", false, "Emit structured logs as JSON (to stderr); default is text")
 	flag.Parse()
+
+	// Configure slog — logs always go to stderr, report JSON stays on stdout.
+	var handler slog.Handler
+	if *jsonLogs {
+		handler = slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	}
+	slog.SetDefault(slog.New(handler))
 
 	if *org == "" {
 		emitError("org flag is required")
@@ -127,39 +138,41 @@ func main() {
 		},
 	}
 
+	slog.Info("starting digest fetch", "org", *org, "hours", *hours, "since", since.Format(time.RFC3339))
+
 	// Gather GitHub data
 	// Each function handles its own errors and returns empty results on failure
 	prsMerged, err := fetchMergedPRs(*org, since)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[daily-digest] warning: failed to fetch merged PRs: %v\n", err)
+		slog.Warn("failed to fetch merged PRs", "error", err)
 		prsMerged = []PR{} // Ensure non-nil slice for JSON output
 	}
 	out.GitHub.PRsMerged = prsMerged
 
 	prsOpened, err := fetchOpenedPRs(*org, since)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[daily-digest] warning: failed to fetch opened PRs: %v\n", err)
+		slog.Warn("failed to fetch opened PRs", "error", err)
 		prsOpened = []PR{} // Ensure non-nil slice for JSON output
 	}
 	out.GitHub.PRsOpened = prsOpened
 
 	issuesClosed, err := fetchClosedIssues(*org, since)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[daily-digest] warning: failed to fetch closed issues: %v\n", err)
+		slog.Warn("failed to fetch closed issues", "error", err)
 		issuesClosed = []Issue{} // Ensure non-nil slice for JSON output
 	}
 	out.GitHub.IssuesClosed = issuesClosed
 
 	issuesOpened, err := fetchOpenedIssues(*org, since)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[daily-digest] warning: failed to fetch opened issues: %v\n", err)
+		slog.Warn("failed to fetch opened issues", "error", err)
 		issuesOpened = []Issue{} // Ensure non-nil slice for JSON output
 	}
 	out.GitHub.IssuesOpened = issuesOpened
 
 	commits, err := fetchCommits(*org, since)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "[daily-digest] warning: failed to fetch commits: %v\n", err)
+		slog.Warn("failed to fetch commits", "error", err)
 		commits = Commits{Total: 0, ByRepo: make(map[string]int)}
 	}
 	out.GitHub.Commits = commits
@@ -167,10 +180,20 @@ func main() {
 	// Compute summary
 	out.Summary = computeSummary(out.GitHub)
 
+	slog.Info("digest complete",
+		"prs_merged", len(out.GitHub.PRsMerged),
+		"prs_opened", len(out.GitHub.PRsOpened),
+		"issues_closed", len(out.GitHub.IssuesClosed),
+		"issues_opened", len(out.GitHub.IssuesOpened),
+		"commits", out.GitHub.Commits.Total,
+		"active_repos", len(out.Summary.ActiveRepos),
+	)
+
 	emitJSON(out)
 }
 
 func emitError(msg string) {
+	slog.Error("fatal error", "msg", msg)
 	emitJSON(Output{
 		GeneratedAt: time.Now().UTC().Format(time.RFC3339),
 		Error:       msg,
@@ -185,6 +208,7 @@ func emitJSON(v any) {
 }
 
 func fetchMergedPRs(org string, since time.Time) ([]PR, error) {
+	slog.Info("fetching merged PRs", "org", org)
 	// Use gh search prs with merged:>=date filter
 	sinceStr := since.Format("2006-01-02")
 	args := []string{
@@ -221,10 +245,12 @@ func fetchMergedPRs(org string, since time.Time) ([]PR, error) {
 			Author: r.Author.Login,
 		})
 	}
+	slog.Info("fetched merged PRs", "count", len(prs))
 	return prs, nil
 }
 
 func fetchOpenedPRs(org string, since time.Time) ([]PR, error) {
+	slog.Info("fetching opened PRs", "org", org)
 	sinceStr := since.Format("2006-01-02")
 	args := []string{
 		"search", "prs",
@@ -260,10 +286,12 @@ func fetchOpenedPRs(org string, since time.Time) ([]PR, error) {
 			Author: r.Author.Login,
 		})
 	}
+	slog.Info("fetched opened PRs", "count", len(prs))
 	return prs, nil
 }
 
 func fetchClosedIssues(org string, since time.Time) ([]Issue, error) {
+	slog.Info("fetching closed issues", "org", org)
 	sinceStr := since.Format("2006-01-02")
 	args := []string{
 		"search", "issues",
@@ -299,10 +327,12 @@ func fetchClosedIssues(org string, since time.Time) ([]Issue, error) {
 			Author: r.Author.Login,
 		})
 	}
+	slog.Info("fetched closed issues", "count", len(issues))
 	return issues, nil
 }
 
 func fetchOpenedIssues(org string, since time.Time) ([]Issue, error) {
+	slog.Info("fetching opened issues", "org", org)
 	sinceStr := since.Format("2006-01-02")
 	args := []string{
 		"search", "issues",
@@ -338,6 +368,7 @@ func fetchOpenedIssues(org string, since time.Time) ([]Issue, error) {
 			Author: r.Author.Login,
 		})
 	}
+	slog.Info("fetched opened issues", "count", len(issues))
 	return issues, nil
 }
 
@@ -352,6 +383,7 @@ type commitResult struct {
 }
 
 func fetchCommits(org string, since time.Time) (Commits, error) {
+	slog.Info("fetching commits", "org", org)
 	// Get list of repos in the org, then fetch commits for each
 	repos, err := fetchOrgRepos(org)
 	if err != nil {
@@ -369,7 +401,7 @@ func fetchCommits(org string, since time.Time) (Commits, error) {
 		count, err := fetchRepoCommitCount(org, repo, sinceStr)
 		if err != nil {
 			// Log warning but continue with other repos
-			fmt.Fprintf(os.Stderr, "[daily-digest] warning: failed to fetch commits for %s: %v\n", repo, err)
+			slog.Warn("failed to fetch commits for repo", "repo", repo, "error", err)
 			continue
 		}
 		if count > 0 {
@@ -378,6 +410,7 @@ func fetchCommits(org string, since time.Time) (Commits, error) {
 		}
 	}
 
+	slog.Info("fetched commits", "total", commits.Total, "repos_with_activity", len(commits.ByRepo))
 	return commits, nil
 }
 
